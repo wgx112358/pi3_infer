@@ -1,3 +1,35 @@
+#!/usr/bin/env python3
+"""
+Distributed video processing worker with multi-GPU container support.
+
+KEY CONCEPT: GPU-based data distribution
+- Data is distributed across individual GPUs, not containers
+- Each GPU gets a unique subset of the total video dataset
+- Containers can contain multiple GPUs that work in parallel
+
+USAGE EXAMPLES:
+
+1. Single GPU container (traditional):
+   python 2_run_distributed_worker.py --instance-id 0 --total-instances 56 --gpus-per-container 1
+
+2. 8-GPU container (GPUs 0-7):
+   python 2_run_distributed_worker.py --instance-id 0 --total-instances 56 --gpus-per-container 8
+   
+3. Mixed deployment (56 total GPUs):
+   Container A: --instance-id 0  --gpus-per-container 8  (uses GPUs 0-7)
+   Container B: --instance-id 8  --gpus-per-container 8  (uses GPUs 8-15) 
+   Container C: --instance-id 16 --gpus-per-container 1  (uses GPU 16)
+   ...
+
+PARAMETERS:
+- --instance-id: Starting GPU ID for this container (e.g., 0, 8, 16...)
+- --total-instances: Total number of GPUs across ALL containers (e.g., 56)
+- --gpus-per-container: Number of GPUs in THIS container (default: 1)
+
+The script automatically spawns separate processes for each GPU in the container,
+with each GPU processing its assigned subset of the video dataset.
+"""
+
 import os
 import argparse
 import subprocess
@@ -135,12 +167,13 @@ def validate_environment():
 
 def main():
     """
-    Main processing script for a single container instance with comprehensive logging and memory optimization.
+    Main processing script for multi-GPU container with automatic GPU assignment.
     """
-    parser = argparse.ArgumentParser(description="Distributed video processing worker with memory optimization and comprehensive logging.")
+    parser = argparse.ArgumentParser(description="Distributed video processing worker with multi-GPU container support.")
     # --- Job Distribution Arguments ---
-    parser.add_argument("--instance-id", type=int, required=True, help="The unique ID of this container instance (e.g., from 0 to 55).")
-    parser.add_argument("--total-instances", type=int, required=True, help="The total number of container instances.")
+    parser.add_argument("--instance-id", type=int, required=True, help="The starting GPU ID for this container (e.g., 0 for first container, 8 for second 8-GPU container).")
+    parser.add_argument("--total-instances", type=int, required=True, help="The total number of GPUs across all containers.")
+    parser.add_argument("--gpus-per-container", type=int, default=1, help="Number of GPUs in this container (default: 1).")
     
     # --- Path Arguments ---
     parser.add_argument("--video-dir", type=str, required=True, help="The base directory where videos are stored.")
@@ -148,28 +181,73 @@ def main():
     parser.add_argument("--output-dir", type=str, required=True, help="The directory to save the final output files (.npz).")
 
     # --- Model & Inference Arguments ---
-    parser.add_argument("--gpu-id", type=int, default=0, help="The GPU ID to use within the container.")
     parser.add_argument("--ckpt", type=str, default=None, help="Path to a local model checkpoint file.")
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum number of retries per slice.")
     parser.add_argument("--timeout", type=int, default=3600, help="Timeout in seconds for each slice processing.")
     
     args = parser.parse_args()
 
+    # Multi-GPU container processing
+    if args.gpus_per_container > 1:
+        print(f"Starting {args.gpus_per_container} GPU workers in this container (GPU {args.instance_id}-{args.instance_id + args.gpus_per_container - 1})")
+        
+        import multiprocessing as mp
+        processes = []
+        
+        for gpu_offset in range(args.gpus_per_container):
+            gpu_id = args.instance_id + gpu_offset
+            
+            # Create a new process for each GPU
+            p = mp.Process(target=run_single_gpu_worker, args=(
+                gpu_id,
+                args.total_instances,
+                args.video_dir,
+                args.shared_dir,
+                args.output_dir,
+                args.ckpt,
+                args.max_retries,
+                args.timeout
+            ))
+            p.start()
+            processes.append(p)
+        
+        # Wait for all processes to complete
+        for p in processes:
+            p.join()
+            
+        print(f"All {args.gpus_per_container} GPU workers completed")
+    else:
+        # Single GPU processing
+        run_single_gpu_worker(
+            args.instance_id,
+            args.total_instances,
+            args.video_dir,
+            args.shared_dir,
+            args.output_dir,
+            args.ckpt,
+            args.max_retries,
+            args.timeout
+        )
+
+def run_single_gpu_worker(gpu_id, total_instances, video_dir, shared_dir, output_dir, ckpt, max_retries, timeout):
+    """
+    Run processing on a single GPU.
+    """
     # Set environment variable for logging
-    os.environ['INSTANCE_ID'] = str(args.instance_id)
+    os.environ['INSTANCE_ID'] = str(gpu_id)
 
     # Use comprehensive logging context
-    with comprehensive_logging_context(args.shared_dir, args.instance_id) as logger:
+    with comprehensive_logging_context(shared_dir, gpu_id) as logger:
         
         # Log system information for debugging
         log_system_info(logger)
         
         # Log startup information
-        logger.info(f"Worker instance {args.instance_id}/{args.total_instances} starting")
-        logger.info(f"Video directory: {args.video_dir}")
-        logger.info(f"Shared directory: {args.shared_dir}")
-        logger.info(f"Output directory: {args.output_dir}")
-        logger.info(f"GPU ID: {args.gpu_id}")
+        logger.info(f"Worker instance {gpu_id}/{total_instances} starting")
+        logger.info(f"Video directory: {video_dir}")
+        logger.info(f"Shared directory: {shared_dir}")
+        logger.info(f"Output directory: {output_dir}")
+        logger.info(f"GPU ID: {gpu_id}")
         
         start_time = time.time()
 
@@ -179,16 +257,16 @@ def main():
             sys.exit(1)
 
         # --- 1. Setup Paths ---
-        master_list_path = os.path.join(args.shared_dir, "master_video_list.txt")
-        completed_dir = os.path.join(args.shared_dir, "completed_markers")
+        master_list_path = os.path.join(shared_dir, "master_video_list.txt")
+        completed_dir = os.path.join(shared_dir, "completed_markers")
         os.makedirs(completed_dir, exist_ok=True)
-        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(output_dir, exist_ok=True)
 
-        print(f"Worker Instance {args.instance_id}/{args.total_instances}")
+        print(f"Worker Instance {gpu_id}/{total_instances}")
         print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Shared directory: {args.shared_dir}")
-        print(f"Output directory: {args.output_dir}")
-        print(f"GPU ID: {args.gpu_id}")
+        print(f"Shared directory: {shared_dir}")
+        print(f"Output directory: {output_dir}")
+        print(f"GPU ID: {gpu_id}")
 
         # --- 2. Get Full Job List ---
         all_jobs = get_job_list(master_list_path)
@@ -198,7 +276,7 @@ def main():
 
         # --- 3. Determine Jobs for THIS Instance ---
         # Each instance gets a unique, consistent slice of the master list
-        jobs_for_this_instance = all_jobs[args.instance_id::args.total_instances]
+        jobs_for_this_instance = all_jobs[gpu_id::total_instances]
         
         if not jobs_for_this_instance:
             print("No jobs assigned to this instance. Exiting.")
@@ -221,7 +299,7 @@ def main():
             logger.info(f"Starting video {i+1}/{len(jobs_for_this_instance)}: {video_relative_path}")
             
             # Define video_full_path first
-            video_full_path = os.path.join(args.video_dir, video_relative_path)
+            video_full_path = os.path.join(video_dir, video_relative_path)
             
             # Log basic video file information for debugging
             try:
@@ -246,10 +324,10 @@ def main():
                 continue
 
             # Additional check: verify all slice outputs exist
-            if check_all_slices_exist(args.output_dir, video_basename):
+            if check_all_slices_exist(output_dir, video_basename):
                 print("All slice outputs exist but not marked as complete. Marking now...")
                 logger.info(f"Video {video_basename} has all slices but not marked complete, marking now")
-                if mark_job_as_completed(completed_dir, video_relative_path, args.output_dir):
+                if mark_job_as_completed(completed_dir, video_relative_path, output_dir):
                     completed_in_this_session += 1
                 continue
 
@@ -258,7 +336,7 @@ def main():
                 error_msg = f"Source video file not found: {video_full_path}"
                 print(f"Video file not found: {video_full_path}")
                 logger.error(f"Video file not found: {video_full_path}")
-                log_failed_job(args.shared_dir, video_relative_path, error_msg)
+                log_failed_job(shared_dir, video_relative_path, error_msg)
                 failed_in_this_session += 1
                 continue
 
@@ -268,7 +346,7 @@ def main():
             
             for slice_num in [1, 2, 3]:
                 slice_output_name = f"{video_basename}_part{slice_num}_poses.npz"
-                slice_output_path = os.path.join(args.output_dir, slice_output_name)
+                slice_output_path = os.path.join(output_dir, slice_output_name)
 
                 print(f"  Processing slice {slice_num}/3...")
                 logger.info(f"Processing slice {slice_num}/3 for video {video_basename}")
@@ -282,11 +360,11 @@ def main():
                 slice_succeeded = False
                 last_error = None
                 
-                for attempt in range(args.max_retries):
-                    print(f"    Attempt {attempt + 1}/{args.max_retries} for slice {slice_num}...")
-                    logger.info(f"Slice {slice_num} attempt {attempt + 1}/{args.max_retries}")
+                for attempt in range(max_retries):
+                    print(f"    Attempt {attempt + 1}/{max_retries} for slice {slice_num}...")
+                    logger.info(f"Slice {slice_num} attempt {attempt + 1}/{max_retries}")
                     
-                    device_name = f"cuda:{args.gpu_id}"
+                    device_name = f"cuda:{gpu_id}" # Use the instance_id for device name
                     command = [
                         "python", "run_inference.py",
                         "--data_path", video_full_path,
@@ -295,13 +373,13 @@ def main():
                         "--device", device_name,
                         "--slice_part", str(slice_num)  # Memory-optimized slicing
                     ]
-                    if args.ckpt:
-                        command.extend(["--ckpt", args.ckpt])
+                    if ckpt:
+                        command.extend(["--ckpt", ckpt])
 
                     try:
                         print(f"      Running: {' '.join(command)}")
                         logger.debug(f"Command: {' '.join(command)}")
-                        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=args.timeout)
+                        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
                         
                         # Verify output file was actually created
                         if os.path.exists(slice_output_path):
@@ -315,7 +393,7 @@ def main():
                             logger.warning(last_error)
 
                     except subprocess.TimeoutExpired:
-                        last_error = f"Process timed out after {args.timeout} seconds"
+                        last_error = f"Process timed out after {timeout} seconds"
                         print(f"    TIMEOUT on attempt {attempt + 1}: {last_error}")
                         logger.warning(f"Slice {slice_num} timed out on attempt {attempt + 1}")
                         
@@ -331,22 +409,22 @@ def main():
                         logger.error(f"Unexpected error in slice {slice_num}: {last_error}")
                         break  # Don't retry on unexpected errors
 
-                    if attempt < args.max_retries - 1:
+                    if attempt < max_retries - 1:
                         print(f"      Retrying in 5 seconds...")
                         time.sleep(5)
 
                 # If this slice ultimately failed after all retries
                 if not slice_succeeded:
-                    print(f"    FAILURE: Slice {slice_num} failed after {args.max_retries} attempts")
+                    print(f"    FAILURE: Slice {slice_num} failed after {max_retries} attempts")
                     logger.error(f"Slice {slice_num} failed after all retry attempts: {last_error}")
-                    log_failed_job(args.shared_dir, video_relative_path, last_error or "Unknown error", slice_num)
+                    log_failed_job(shared_dir, video_relative_path, last_error or "Unknown error", slice_num)
                     is_video_fully_processed = False
                     failed_slice = slice_num
                     break
 
             # --- 4d. Mark Job as Completed (ATOMIC step with verification) ---
             if is_video_fully_processed:
-                if mark_job_as_completed(completed_dir, video_relative_path, args.output_dir):
+                if mark_job_as_completed(completed_dir, video_relative_path, output_dir):
                     completed_in_this_session += 1
                     print(f"Video {video_basename} fully processed and marked as completed!")
                     logger.info(f"Video {video_basename} completed successfully")
@@ -354,17 +432,17 @@ def main():
                     print(f"Video {video_basename} processed but could not be marked as completed!")
                     logger.error(f"Video {video_basename} could not be marked as completed")
             else:
-                failure_reason = f"Slice {failed_slice} failed after {args.max_retries} retries"
+                failure_reason = f"Slice {failed_slice} failed after {max_retries} retries"
                 print(f"Video {video_basename} was not fully processed: {failure_reason}")
                 logger.error(f"Video {video_basename} failed: {failure_reason}")
                 failed_in_this_session += 1
 
             # Update progress
-            log_progress(args.shared_dir, args.instance_id, completed_in_this_session, len(jobs_for_this_instance))
+            log_progress(shared_dir, gpu_id, completed_in_this_session, len(jobs_for_this_instance))
 
         end_time = time.time()
         
-        print(f"\nInstance {args.instance_id} completed its assigned jobs")
+        print(f"\nInstance {gpu_id} completed its assigned jobs")
         print(f"Processed {completed_in_this_session} videos in this session")
         print(f"Failed {failed_in_this_session} videos in this session")
         print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
