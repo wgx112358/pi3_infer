@@ -1,7 +1,7 @@
 import torch
 import argparse
 import numpy as np
-from pi3.utils.basic import load_images_as_tensor, write_ply
+from pi3.utils.basic import load_images_as_tensor_sliced, write_ply
 from pi3.utils.geometry import depth_edge
 from pi3.models.pi3 import Pi3
 
@@ -21,6 +21,8 @@ if __name__ == '__main__':
                         help="Path to the model checkpoint file. Default: None")
     parser.add_argument("--device", type=str, default='cuda',
                         help="Device to run inference on ('cuda' or 'cpu'). Default: 'cuda'")
+    parser.add_argument("--slice_part", type=int, default=None, choices=[1, 2, 3],
+                        help="Process only a specific part of the video: 1 (first 1/3), 2 (middle 1/3), or 3 (last 1/3). Default: None (process full video)")
                         
     args = parser.parse_args()
     if args.interval < 0:
@@ -47,15 +49,35 @@ if __name__ == '__main__':
         # or download checkpoints from `https://huggingface.co/yyfz233/Pi3/resolve/main/model.safetensors`, and `--ckpt ckpts/model.safetensors`
 
     # 2. Prepare input data
-    # The load_images_as_tensor function will print the loading path
-    imgs = load_images_as_tensor(args.data_path, interval=args.interval).to(device) # (N, 3, H, W)
+    # The `load_images_as_tensor_sliced` function now handles slicing directly and efficiently.
+    # We pass the slice_part argument to it, and it will only load the necessary frames.
+    print("Loading images...")
     
-
+    imgs = load_images_as_tensor_sliced(
+        args.data_path, 
+        interval=args.interval, 
+        device=args.device,  # Pass string device name for consistency
+        slice_part=args.slice_part,
+        total_slices=3  # We are always using 3 slices
+    )
+    
+    # Simple loading confirmation
+    if args.slice_part is not None:
+        print(f"Loaded slice {args.slice_part}/3: {imgs.shape[0]} frames")
+    else:
+        print(f"Loaded {imgs.shape[0]} frames")
+    
     # 3. Infer
     print("Running model inference...")
-    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    # Determine dtype based on device capability for CUDA, or use float16 for CPU
+    if device.type == 'cuda':
+        dtype = torch.bfloat16 if torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
+    else:
+        dtype = torch.float32  # Use float32 for CPU
+    device_type = device.type  # Get device type ('cuda' or 'cpu') for autocast
+    
     with torch.no_grad():
-        with torch.amp.autocast('cuda', dtype=dtype):
+        with torch.amp.autocast(device_type, dtype=dtype):
             res = model(imgs[None]) # Add batch dimension
 
     # 4. Save points (optional)

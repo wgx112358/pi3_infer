@@ -21,8 +21,6 @@ if __name__ == '__main__':
                         help="Path to the model checkpoint file. Default: None")
     parser.add_argument("--device", type=str, default='cuda',
                         help="Device to run inference on ('cuda' or 'cpu'). Default: 'cuda'")
-    parser.add_argument("--slice_part", type=int, default=None, choices=[1, 2, 3],
-                        help="Process only a specific part of the video: 1 (first 1/3), 2 (middle 1/3), or 3 (last 1/3). Default: None (process full video)")
                         
     args = parser.parse_args()
     if args.interval < 0:
@@ -49,38 +47,8 @@ if __name__ == '__main__':
         # or download checkpoints from `https://huggingface.co/yyfz233/Pi3/resolve/main/model.safetensors`, and `--ckpt ckpts/model.safetensors`
 
     # 2. Prepare input data
-    # Load images to CPU first to prevent OOM on GPU when slicing
-    print("Loading images to CPU RAM...")
-    imgs_cpu = load_images_as_tensor(args.data_path, interval=args.interval)
-    print(f"Loaded {imgs_cpu.shape[0]} frames to CPU.")
-    
-    # Apply slicing on CPU if slice_part is specified
-    if args.slice_part is not None:
-        total_frames = imgs_cpu.shape[0]
-        slice_size = total_frames // 3
-        
-        if args.slice_part == 1:
-            # First 1/3
-            start_idx = 0
-            end_idx = slice_size
-        elif args.slice_part == 2:
-            # Middle 1/3
-            start_idx = slice_size
-            end_idx = 2 * slice_size
-        else:  # args.slice_part == 3
-            # Last 1/3
-            start_idx = 2 * slice_size
-            end_idx = total_frames
-        
-        print(f"Slicing on CPU: processing slice {args.slice_part}/3, frames {start_idx} to {end_idx-1}")
-        imgs_to_process = imgs_cpu[start_idx:end_idx]
-    else:
-        imgs_to_process = imgs_cpu
-
-    # Move only the necessary (potentially sliced) data to the GPU
-    print(f"Moving {imgs_to_process.shape[0]} frames to GPU ({args.device})...")
-    imgs = imgs_to_process.to(device)
-    print("Data moved to GPU successfully.")
+    # The load_images_as_tensor function will print the loading path
+    imgs = load_images_as_tensor(args.data_path, interval=args.interval).to(device) # (N, 3, H, W)
     
 
     # 3. Infer

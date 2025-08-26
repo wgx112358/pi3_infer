@@ -8,6 +8,152 @@ from torchvision import transforms
 from plyfile import PlyData, PlyElement
 import numpy as np
 
+def load_images_as_tensor_sliced(path='data/truck', interval=1, PIXEL_LIMIT=255000, device='cpu', slice_part=None, total_slices=3):
+    """
+    Loads images from a directory or video, with support for video slicing to avoid memory overflow.
+    Resizes them to a uniform size, then converts and stacks them into a single [N, 3, H, W] PyTorch tensor.
+    
+    Args:
+        path (str): Path to image directory or video file
+        interval (int): Sampling interval for frames
+        PIXEL_LIMIT (int): Maximum pixels per image after resizing
+        device (str): Target device for the tensor ('cpu' or 'cuda')
+        slice_part (int): Which slice to load (1, 2, or 3). If None, loads full video.
+        total_slices (int): Total number of slices to divide the video into
+    
+    Returns:
+        torch.Tensor: Stacked tensor of shape [N, 3, H, W] on the specified device
+    """
+    sources = [] 
+    
+    # --- 1. Load image paths or video frames ---
+    if osp.isdir(path):
+        print(f"Loading images from directory: {path}")
+        filenames = sorted([x for x in os.listdir(path) if x.lower().endswith(('.png', '.jpg', '.jpeg'))])
+        for i in range(0, len(filenames), interval):
+            img_path = osp.join(path, filenames[i])
+            try:
+                sources.append(Image.open(img_path).convert('RGB'))
+            except Exception as e:
+                print(f"Could not load image {filenames[i]}: {e}")
+    elif path.lower().endswith('.mp4'):
+        print(f"Loading frames from video: {path}")
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened(): 
+            raise IOError(f"Cannot open video file: {path}")
+        
+        # Get total frame count for slicing calculation
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"Video has {total_frames} total frames at {fps:.2f} FPS")
+        
+        if slice_part is not None:
+            # Calculate frame range for this slice
+            frames_per_slice = total_frames // total_slices
+            start_frame = (slice_part - 1) * frames_per_slice
+            if slice_part == total_slices:
+                # Last slice gets any remaining frames
+                end_frame = total_frames
+            else:
+                end_frame = slice_part * frames_per_slice
+            
+            # OPTIMIZATION: Set video position to start frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            frame_idx = start_frame
+        else:
+            frame_idx = 0
+            start_frame = 0
+            end_frame = total_frames
+        
+        # OPTIMIZATION: Pre-calculate which frames we actually need
+        target_frames = []
+        for f_idx in range(start_frame, end_frame):
+            if (f_idx - start_frame) % interval == 0:
+                target_frames.append(f_idx)
+        
+        current_target_idx = 0
+        while frame_idx < end_frame and current_target_idx < len(target_frames):
+            next_target = target_frames[current_target_idx]
+            
+            # OPTIMIZATION: Skip frames by seeking when gap is large
+            if frame_idx < next_target and (next_target - frame_idx) > 10:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, next_target)
+                frame_idx = next_target
+            
+            ret, frame = cap.read()
+            if not ret: 
+                break
+            
+            # Only process frames we actually need
+            if frame_idx == next_target:
+                # OPTIMIZATION: Process RGB conversion more efficiently
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                sources.append(Image.fromarray(rgb_frame))
+                current_target_idx += 1
+            
+            frame_idx += 1
+            
+        cap.release()
+    else:
+        raise ValueError(f"Unsupported path. Must be a directory or a .mp4 file: {path}")
+
+    if not sources:
+        print("No images found or loaded.")
+        return torch.empty(0, device=device)
+
+    print(f"Found {len(sources)} images/frames. Processing...")
+
+    # --- 2. Determine a uniform target size for all images based on the first image ---
+    # This is necessary to ensure all tensors have the same dimensions for stacking.
+    first_img = sources[0]
+    W_orig, H_orig = first_img.size
+    scale = math.sqrt(PIXEL_LIMIT / (W_orig * H_orig)) if W_orig * H_orig > 0 else 1
+    W_target, H_target = W_orig * scale, H_orig * scale
+    k, m = round(W_target / 14), round(H_target / 14)
+    while (k * 14) * (m * 14) > PIXEL_LIMIT:
+        if k / m > W_target / H_target: k -= 1
+        else: m -= 1
+    TARGET_W, TARGET_H = max(1, k) * 14, max(1, m) * 14
+    print(f"All images will be resized to a uniform size: ({TARGET_W}, {TARGET_H})")
+
+    # --- 3. OPTIMIZATION: Batch processing and more efficient tensor creation ---
+    tensor_list = []
+    # Define a transform to convert a PIL Image to a CxHxW tensor and normalize to [0,1]
+    to_tensor_transform = transforms.ToTensor()
+    
+    # Process images in smaller batches to reduce memory pressure
+    batch_size = min(50, len(sources))  # Process in batches of 50
+    for batch_start in range(0, len(sources), batch_size):
+        batch_end = min(batch_start + batch_size, len(sources))
+        batch_sources = sources[batch_start:batch_end]
+        
+        for img_pil in batch_sources:
+            try:
+                # Resize to the uniform target size
+                resized_img = img_pil.resize((TARGET_W, TARGET_H), Image.Resampling.LANCZOS)
+                # Convert to tensor and move to specified device
+                img_tensor = to_tensor_transform(resized_img).to(device)
+                tensor_list.append(img_tensor)
+            except Exception as e:
+                print(f"Error processing an image: {e}")
+        
+        # OPTIMIZATION: Clear batch from memory
+        del batch_sources
+
+    if not tensor_list:
+        print("No images were successfully processed.")
+        return torch.empty(0, device=device)
+
+    # --- 4. Stack the list of tensors into a single [N, C, H, W] batch tensor ---
+    result_tensor = torch.stack(tensor_list, dim=0)
+    
+    # OPTIMIZATION: Clear intermediate data from memory
+    del tensor_list
+    del sources
+    
+    return result_tensor
+
+
 def load_images_as_tensor(path='data/truck', interval=1, PIXEL_LIMIT=255000):
     """
     Loads images from a directory or video, resizes them to a uniform size,

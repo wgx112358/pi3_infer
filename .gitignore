@@ -21,6 +21,7 @@ ckpts
 output/
 output1/
 output2/
+output3/
 diff/
 resize_demo_imgs.py
 img_dir_to_video.py
