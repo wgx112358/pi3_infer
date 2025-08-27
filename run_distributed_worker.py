@@ -195,11 +195,13 @@ def main():
         processes = []
         
         for gpu_offset in range(args.gpus_per_container):
-            gpu_id = args.instance_id + gpu_offset
+            global_gpu_id = args.instance_id + gpu_offset  # For data distribution
+            local_gpu_id = gpu_offset  # For CUDA device selection
             
             # Create a new process for each GPU
             p = mp.Process(target=run_single_gpu_worker, args=(
-                gpu_id,
+                global_gpu_id,
+                local_gpu_id,
                 args.total_instances,
                 args.video_dir,
                 args.shared_dir,
@@ -219,7 +221,8 @@ def main():
     else:
         # Single GPU processing
         run_single_gpu_worker(
-            args.instance_id,
+            args.instance_id,  # global_gpu_id
+            0,  # local_gpu_id (always 0 for single GPU)
             args.total_instances,
             args.video_dir,
             args.shared_dir,
@@ -229,25 +232,29 @@ def main():
             args.timeout
         )
 
-def run_single_gpu_worker(gpu_id, total_instances, video_dir, shared_dir, output_dir, ckpt, max_retries, timeout):
+def run_single_gpu_worker(global_gpu_id, local_gpu_id, total_instances, video_dir, shared_dir, output_dir, ckpt, max_retries, timeout):
     """
     Run processing on a single GPU.
+    
+    Args:
+        global_gpu_id: Global GPU ID used for data distribution across all containers
+        local_gpu_id: Local GPU ID used for CUDA device selection within this container
     """
     # Set environment variable for logging
-    os.environ['INSTANCE_ID'] = str(gpu_id)
+    os.environ['INSTANCE_ID'] = str(global_gpu_id)
 
     # Use comprehensive logging context
-    with comprehensive_logging_context(shared_dir, gpu_id) as logger:
+    with comprehensive_logging_context(shared_dir, global_gpu_id) as logger:
         
         # Log system information for debugging
         log_system_info(logger)
         
         # Log startup information
-        logger.info(f"Worker instance {gpu_id}/{total_instances} starting")
+        logger.info(f"Worker instance {global_gpu_id}/{total_instances} starting")
         logger.info(f"Video directory: {video_dir}")
         logger.info(f"Shared directory: {shared_dir}")
         logger.info(f"Output directory: {output_dir}")
-        logger.info(f"GPU ID: {gpu_id}")
+        logger.info(f"Global GPU ID: {global_gpu_id}, Local GPU ID: {local_gpu_id}")
         
         start_time = time.time()
 
@@ -262,11 +269,11 @@ def run_single_gpu_worker(gpu_id, total_instances, video_dir, shared_dir, output
         os.makedirs(completed_dir, exist_ok=True)
         os.makedirs(output_dir, exist_ok=True)
 
-        print(f"Worker Instance {gpu_id}/{total_instances}")
+        print(f"Worker Instance {global_gpu_id}/{total_instances}")
         print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Shared directory: {shared_dir}")
         print(f"Output directory: {output_dir}")
-        print(f"GPU ID: {gpu_id}")
+        print(f"Global GPU ID: {global_gpu_id}, Local GPU ID: {local_gpu_id}")
 
         # --- 2. Get Full Job List ---
         all_jobs = get_job_list(master_list_path)
@@ -276,7 +283,7 @@ def run_single_gpu_worker(gpu_id, total_instances, video_dir, shared_dir, output
 
         # --- 3. Determine Jobs for THIS Instance ---
         # Each instance gets a unique, consistent slice of the master list
-        jobs_for_this_instance = all_jobs[gpu_id::total_instances]
+        jobs_for_this_instance = all_jobs[global_gpu_id::total_instances]
         
         if not jobs_for_this_instance:
             print("No jobs assigned to this instance. Exiting.")
@@ -364,7 +371,7 @@ def run_single_gpu_worker(gpu_id, total_instances, video_dir, shared_dir, output
                     print(f"    Attempt {attempt + 1}/{max_retries} for slice {slice_num}...")
                     logger.info(f"Slice {slice_num} attempt {attempt + 1}/{max_retries}")
                     
-                    device_name = f"cuda:{gpu_id}" # Use the instance_id for device name
+                    device_name = f"cuda:{local_gpu_id}" # Use the local GPU ID for device name
                     command = [
                         "python", "run_inference.py",
                         "--data_path", video_full_path,
@@ -438,11 +445,11 @@ def run_single_gpu_worker(gpu_id, total_instances, video_dir, shared_dir, output
                 failed_in_this_session += 1
 
             # Update progress
-            log_progress(shared_dir, gpu_id, completed_in_this_session, len(jobs_for_this_instance))
+            log_progress(shared_dir, global_gpu_id, completed_in_this_session, len(jobs_for_this_instance))
 
         end_time = time.time()
         
-        print(f"\nInstance {gpu_id} completed its assigned jobs")
+        print(f"\nInstance {global_gpu_id} completed its assigned jobs")
         print(f"Processed {completed_in_this_session} videos in this session")
         print(f"Failed {failed_in_this_session} videos in this session")
         print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
